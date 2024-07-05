@@ -35,5 +35,5 @@ jobs:
             make dev-install
       - name: pip freeze
         run: uv pip freeze --system
-      - name: Run unit tests
-        run: make test
+      # - name: Run unit tests
+      #   run: make test

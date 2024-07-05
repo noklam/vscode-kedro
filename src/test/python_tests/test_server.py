@@ -20,7 +20,7 @@ from pytest_lsp import (
     config=ClientServerConfig(
         server_command=[
             sys.executable,
-            "/Users/Nok_Lam_Chan/dev/vscode-python-tools-extension-template/bundled/tool/lsp_server.py",
+            "../../../../bundled/tool/lsp_server.py",
         ],
     ),
 )
