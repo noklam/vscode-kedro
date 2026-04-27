@@ -92,6 +92,8 @@ from kedro.framework.startup import (
     bootstrap_project,
 )
 from kedro.io import DataCatalog
+from omegaconf import OmegaConf
+from omegaconf.errors import OmegaConfBaseException
 from pygls.server import LanguageServer
 
 # Import validators
@@ -100,6 +102,12 @@ from validators import (
     DatasetConfigValidator,
     FullCatalogValidator,
     create_diagnostic,
+)
+from provenance_nav_utils import (
+    interpolation_expression_at_position,
+    interpolation_reference_path_at_position,
+    key_position_for_path,
+    yaml_path_at_position,
 )
 
 
@@ -325,6 +333,212 @@ def _get_param_location(server: KedroLanguageServer, word: str) -> Optional[Loca
         return
 
 
+def _is_conf_yaml(server: KedroLanguageServer, uri: str) -> bool:
+    if server.config_loader is None:
+        return False
+    try:
+        file_path = Path(uris.to_fs_path(uri)).resolve()
+        conf_source = Path(os.fspath(server.config_loader.conf_source)).resolve()
+    except Exception:
+        return False
+    return (
+        file_path.suffix in {".yml", ".yaml"}
+        and conf_source in file_path.parents
+    )
+
+
+def _yaml_path_at_position(document: TextDocument, position: Position) -> Optional[List[Any]]:
+    return yaml_path_at_position(document.source, position.line, position.character)
+
+
+def _get_config_key_for_uri(server: KedroLanguageServer, uri: str) -> Optional[str]:
+    if server.config_loader is None:
+        return None
+    try:
+        target_path = Path(uris.to_fs_path(uri)).resolve()
+    except Exception:
+        return None
+
+    for key in server.config_loader.config_patterns:
+        for conf_path in _get_conf_paths(server, key):
+            try:
+                if conf_path.resolve() == target_path:
+                    return key
+            except Exception:
+                continue
+    return None
+
+
+def _build_provenance_config_for_key(server: KedroLanguageServer, key: str) -> Optional[Any]:
+    if server.config_loader is None:
+        return None
+
+    conf_source = Path(os.fspath(server.config_loader.conf_source))
+    base_prefix = conf_source / server.config_loader.base_env
+    run_env = server.run_env or server.config_loader.base_env
+    run_prefix = conf_source / run_env
+
+    unique_paths = []
+    seen = set()
+    for path in _get_conf_paths(server, key):
+        resolved = path.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            unique_paths.append(resolved)
+
+    base_paths = [path for path in unique_paths if base_prefix in path.parents]
+    run_paths = [path for path in unique_paths if run_prefix in path.parents]
+    other_paths = [
+        path
+        for path in unique_paths
+        if path not in base_paths and path not in run_paths
+    ]
+
+    # Merge order mirrors effective config semantics: base first, then run env.
+    merge_order = sorted(base_paths) + sorted(other_paths) + sorted(run_paths)
+    if not merge_order:
+        return None
+
+    merged = None
+    for path in merge_order:
+        try:
+            loaded = OmegaConf.load(path)
+        except Exception:
+            continue
+        merged = loaded if merged is None else OmegaConf.merge(merged, loaded)
+    return merged
+
+
+def _provenance_to_location(provenance: Any) -> Optional[Location]:
+    if provenance is None:
+        return None
+    if getattr(provenance, "kind", None) != "file":
+        return None
+    source = getattr(provenance, "source", None)
+    line = getattr(provenance, "line", None)
+    column = getattr(provenance, "column", None)
+    if not source or line is None:
+        return None
+
+    source_path = Path(source).expanduser()
+    if not source_path.is_absolute():
+        source_path = Path(os.path.abspath(os.fspath(source_path)))
+
+    start_line = max(line - 1, 0)
+    start_character = max((column or 1) - 1, 0)
+    return Location(
+        uri=source_path.resolve().as_uri(),
+        range=Range(
+            start=Position(line=start_line, character=start_character),
+            end=Position(line=start_line, character=start_character + 1),
+        ),
+    )
+
+
+def _refine_location_to_yaml_key(location: Location, path_tokens: List[Any]) -> Location:
+    try:
+        source_path = Path(uris.to_fs_path(location.uri))
+        source = source_path.read_text(encoding="utf-8")
+    except Exception:
+        return location
+
+    key_pos = key_position_for_path(source, path_tokens)
+    if key_pos is None:
+        return location
+
+    line, character, width = key_pos
+    highlight_width = max(width, 1)
+    return Location(
+        uri=location.uri,
+        range=Range(
+            start=Position(line=line, character=character),
+            end=Position(line=line, character=character + highlight_width),
+        ),
+    )
+
+
+def _lookup_provenance_location(resolved_cfg: Any, path_tokens: List[Any]) -> Tuple[Optional[Location], str]:
+    try:
+        if not path_tokens:
+            provenance = OmegaConf.get_provenance(resolved_cfg)
+            location = _provenance_to_location(provenance)
+            if location:
+                return location, ""
+            if provenance is None:
+                return None, "provenance_unavailable"
+            return None, "provenance_non_file"
+
+        parent_node = resolved_cfg
+        for token in path_tokens[:-1]:
+            parent_node = parent_node[token]
+        last_token = path_tokens[-1]
+
+        provenance = OmegaConf.get_provenance(parent_node, last_token)
+        location = _provenance_to_location(provenance)
+        if location:
+            return location, ""
+        if provenance is None:
+            return None, "provenance_unavailable"
+        return None, "provenance_non_file"
+    except (KeyError, IndexError, TypeError, OmegaConfBaseException):
+        return None, "path_not_resolved"
+    except Exception as e:
+        log_to_output(f"provenance_nav_exception type={type(e).__name__} message={e}")
+        return None, "exception"
+
+
+def _definition_from_yaml_provenance(
+    server: KedroLanguageServer, params: TextDocumentPositionParams, document: TextDocument
+) -> Optional[List[Location]]:
+    log_to_output(
+        f"provenance_nav_attempt uri={params.text_document.uri} line={params.position.line} character={params.position.character}"
+    )
+
+    interpolation_expression = interpolation_expression_at_position(
+        document.source, params.position.line, params.position.character
+    )
+    if interpolation_expression is not None:
+        path_tokens = interpolation_reference_path_at_position(
+            document.source, params.position.line, params.position.character
+        )
+        log_to_output(
+            f"provenance_nav_interpolation expression={interpolation_expression} path={path_tokens}"
+        )
+    else:
+        path_tokens = _yaml_path_at_position(document, params.position)
+        log_to_output(f"provenance_nav_yaml_path path={path_tokens}")
+
+    if path_tokens is None:
+        if interpolation_expression is not None:
+            log_to_output(
+                "provenance_nav_fallback reason=interpolation_not_supported_or_unresolved"
+            )
+        else:
+            log_to_output("provenance_nav_fallback reason=path_not_resolved")
+        return None
+
+    config_key = _get_config_key_for_uri(server, params.text_document.uri)
+    if config_key is None:
+        log_to_output("provenance_nav_fallback reason=path_not_resolved")
+        return None
+
+    resolved_cfg = _build_provenance_config_for_key(server, config_key)
+    if resolved_cfg is None:
+        log_to_output("provenance_nav_fallback reason=provenance_unavailable")
+        return None
+
+    location, reason = _lookup_provenance_location(resolved_cfg, path_tokens)
+    if location:
+        location = _refine_location_to_yaml_key(location, path_tokens)
+        log_to_output(
+            f"provenance_nav_hit source={location.uri} line={location.range.start.line} column={location.range.start.character}"
+        )
+        return [location]
+
+    log_to_output(f"provenance_nav_fallback reason={reason} path={path_tokens}")
+    return None
+
+
 @LSP_SERVER.feature(TEXT_DOCUMENT_DEFINITION)
 def definition(
     server: KedroLanguageServer, params: TextDocumentPositionParams, word=None
@@ -419,14 +633,23 @@ def definition(
         )
     else:
         document = None
+
+    if params and document and _is_conf_yaml(server, params.text_document.uri):
+        provenance_result = _definition_from_yaml_provenance(server, params, document)
+        if provenance_result:
+            return provenance_result
+
     result = _query_parameter(document, word)
     if result:
+        log_for_lsp_debug("legacy_nav_hit branch=parameter")
         return result
     result = _query_catalog(document, word)
     if result:
+        log_for_lsp_debug("legacy_nav_hit branch=catalog")
         return result
     result = _query_pipeline_from_catalog(document, word)
     if result:
+        log_for_lsp_debug("legacy_nav_hit branch=pipeline_from_catalog")
         return result
 
     # Return None so VS Code falls through to other definition providers (e.g. Pylance)
